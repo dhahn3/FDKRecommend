@@ -1,0 +1,290 @@
+
+const ESZ_URL = "https://fcgis.frederickcountymd.gov/server_pub/rest/services/PublicSafety/EmergencyESZ/MapServer/0";
+const ADDR_URL = "https://fcgis.frederickcountymd.gov/server_pub/rest/services/Basemap/Addresses/MapServer/1";
+const CENTERLINE_URL = "https://fcgis.frederickcountymd.gov/server_pub/rest/services/Basemap/Centerlines/MapServer/0";
+const POI_URL = "https://fcgis.frederickcountymd.gov/server/rest/services/Basemap/Basemap/MapServer/18";
+
+let DATA = null;
+let map, pointMarker, eszLayer;
+
+const $ = (s)=>document.querySelector(s);
+function setMsg(el, text, cls='muted'){ el.className = cls; el.textContent = text; }
+function toEsriPoint(lng, lat){ return {x:lng, y:lat, spatialReference:{wkid:4326}}; }
+async function fetchJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+function encodeParams(p){ return Object.entries(p).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&'); }
+function addPoint(latlng){ if(pointMarker) map.removeLayer(pointMarker); pointMarker=L.marker(latlng).addTo(map); }
+function normalizeStationId(id){ const s=String(id||''); const m=s.match(/(\d{3})$/); return m?m[1]:s; }
+
+async function locateByAddress(q){
+  const caps = q.toUpperCase();
+  const where = `UPPER(ADD_FULL) LIKE '${caps.replace(/'/g,"''")}%' OR UPPER(ST_FULL) LIKE '${caps.replace(/'/g,"''")}%'`;
+  const url = `${ADDR_URL}/query?` + encodeParams({ where, outFields:'*', returnGeometry:true, f:'json', outSR:4326 });
+  const data = await fetchJSON(url);
+  if(!data.features?.length) throw new Error('No matches');
+  const f = data.features.find(f=>f.attributes.ST_NUM!=null) || data.features[0];
+  const {x,y} = f.geometry; return [y,x];
+}
+async function locateByPOI(q){
+  const caps = q.toUpperCase();
+  const where = `UPPER(NAME) LIKE '%${caps.replace(/'/g,"''")}%'`;
+  const url = `${POI_URL}/query?` + encodeParams({ where, outFields:'*', returnGeometry:true, f:'json', outSR:4326 });
+  const data = await fetchJSON(url);
+  if(!data.features?.length) throw new Error('No POI found');
+  const {x,y} = data.features[0].geometry; return [y,x];
+}
+async function locateByIntersection(q){
+  const parts = q.split(/&| and /i).map(s=>s.trim()).filter(Boolean);
+  if(parts.length<2) throw new Error('Enter like "Street A & Street B"');
+  const [a,b] = parts.map(s=>s.toUpperCase().replace(/'/g,"''"));
+  const common = "&returnGeometry=true&f=json&outSR=4326&outFields=ST_NAME";
+  const [fa,fb] = await Promise.all([
+    fetchJSON(`${CENTERLINE_URL}/query?where=${encodeURIComponent(`UPPER(ST_NAME) LIKE '%${a}%'`)}${common}`),
+    fetchJSON(`${CENTERLINE_URL}/query?where=${encodeURIComponent(`UPPER(ST_NAME) LIKE '%${b}%'`)}${common}`)
+  ]);
+  if(!fa.features?.length || !fb.features?.length) throw new Error('One or both streets not found');
+  const toLine = f => ({type:'Feature', properties:{name:f.attributes.ST_NAME}, geometry:{type:'LineString', coordinates:f.geometry.paths[0].map(p=>[p[0],p[1]])}});
+  const la=fa.features.map(toLine), lb=fb.features.map(toLine);
+  let intersections = [];
+  for(const ga of la){ for(const gb of lb){ const pts=turf.lineIntersect(ga,gb); if(pts.features.length) intersections.push(...pts.features); } }
+  if(!intersections.length) throw new Error('No line intersection found');
+  const [lng,lat] = intersections[0].geometry.coordinates; return [lat,lng];
+}
+
+// ESZ lookup / view
+async function fetchESZForPoint(lat,lng){
+  const geom = JSON.stringify(toEsriPoint(lng,lat));
+  const url = `${ESZ_URL}/query?`+encodeParams({
+    geometry:geom, geometryType:'esriGeometryPoint', inSR:4326, spatialRel:'esriSpatialRelIntersects',
+    outFields:'*', returnGeometry:true, outSR:4326, f:'json'
+  });
+  const data = await fetchJSON(url);
+  if(!data.features?.length) throw new Error('No ESZ found at that location');
+  return data.features[0];
+}
+function showESZ(feature){
+  eszLayer.clearLayers();
+  const rings = feature.geometry.rings.map(r=>r.map(([x,y])=>[x,y]));
+  eszLayer.addData({type:'Feature', properties:feature.attributes, geometry:{type:'Polygon', coordinates:rings}});
+  map.fitBounds(eszLayer.getBounds(), {padding:[20,20]});
+  const attrs = feature.attributes||{};
+  const esz = (attrs.ESZ ?? attrs.esz ?? '').toString().padStart(4,'0');
+  $('#eszInfo').textContent = esz || '—';
+  const order = DATA.ESZ_ORDER[esz] || [];
+  $('#eszOrder').textContent = order.length ? ('Station order: ' + order.join(' → ')) : 'No station order on file.';
+}
+
+// Run-card-only ranking
+function stationRank(eszOrder, st){ return eszOrder.findIndex(v => normalizeStationId(v)===st); }
+
+function buildCandidatesByOrder(eszOrder, capsNeeded, usedUnits){
+  const cand = []; // {unit, cap, st, rank}
+  for(const stRaw of eszOrder){
+    const st = normalizeStationId(stRaw);
+    const units = (DATA.STATION_UNITS[st]||[]).slice();
+    const rank = stationRank(eszOrder, st);
+    for(const u of units){
+      if(usedUnits.has(u)) continue;
+      const caps = DATA.UNIT_CAPS[u] || [];
+      for(const cap of capsNeeded){
+        if(caps.includes(cap)){
+          cand.push({unit:u, cap, st, rank});
+        }
+      }
+    }
+  }
+  cand.sort((a,b)=> a.rank - b.rank);
+  return cand;
+}
+
+// Helpers
+function unitStation(unit, eszOrder){
+  for(const stRaw of eszOrder){
+    const st = normalizeStationId(stRaw);
+    const arr = DATA.STATION_UNITS[st]||[];
+    if(arr.includes(unit)) return st;
+  }
+  return null;
+}
+
+// Build recommendation: Response picks + IfCloser ADD-ON picks (not substitutes)
+// IfCloser applies when a candidate's station rank is earlier than the earliest rank among the relevant RESPONSE units.
+// We approximate "relevant" by comparing against the earliest chosen RESPONSE rank overall (works for A + BLS cases).
+function recommendUnitsRunCardOnly_Additive(esz){
+  const order = (DATA.ESZ_ORDER[esz]||[]).map(normalizeStationId);
+  const incidentKey = $('#incidentSelect').value;
+  const plan = DATA.PLAN_STRUCT[incidentKey];
+  if(!plan) return [];
+  const groups = plan.groups || [];
+  const ifCloserCounts = Object.assign({}, plan.ifCloser || {});
+  const used = new Set();
+  const out = [];
+
+  const unknown = new Set();
+  for(const g of groups) g.caps.forEach(c => { if(!DATA.CAP_VOCAB.includes(c) && c!=='BC') unknown.add(c); });
+  Object.keys(ifCloserCounts||{}).forEach(c => { if(!DATA.CAP_VOCAB.includes(c)) unknown.add(c); });
+  $('#vocabWarn').style.display = unknown.size ? 'block' : 'none';
+  $('#vocabWarn').textContent = unknown.size ? ('Unknown capability tokens (not in your capability sheet): ' + Array.from(unknown).join(', ')) : '';
+
+  // 1) PRIMARY (Response) selections
+  const responseSelections = []; // [{unit, cap, st, rank}]
+  for(const g of groups){
+    for(let i=0;i<g.qty;i++){
+      let chosen = '';
+
+      if(g.caps.includes('BC')){
+        // BC: first available BC in station order
+        const bcUnits = DATA.BC_UNITS.filter(u=>!used.has(u));
+        let picked = null, pickedSt=null, pickedRank=Infinity;
+        for(const [idx, stRaw] of order.entries()){
+          const st = normalizeStationId(stRaw);
+          const units = DATA.STATION_UNITS[st] || [];
+          const present = units.find(u => bcUnits.includes(u));
+          if(present){ picked = present; pickedSt=st; pickedRank = idx; break; }
+        }
+        if(picked){ chosen = picked; used.add(chosen); responseSelections.push({unit:chosen, cap:'BC', st:pickedSt, rank:pickedRank}); }
+        out.push(chosen || '(BC needed)');
+        continue;
+      }
+
+      const primaryCaps = g.caps.filter(c => DATA.CAP_VOCAB.includes(c));
+      const primaryCands = primaryCaps.length ? buildCandidatesByOrder(order, primaryCaps, used) : [];
+      const bestPrimary = primaryCands[0] || null;
+
+      if(bestPrimary){
+        chosen = bestPrimary.unit; used.add(chosen);
+        responseSelections.push(bestPrimary);
+        out.push(chosen);
+      } else {
+        out.push('(' + (g.caps.join(' OR ')) + ' needed)');
+      }
+    }
+  }
+
+  // 2) IF CLOSER ADD-ONS
+  // Determine baseline rank to compare against: earliest (lowest) rank among RESPONSE selections.
+  // Prefer ambulance anchor when present; otherwise use earliest RESPONSE pick
+  let baselineRank = Infinity;
+  const ambResponses = responseSelections.filter(sel => (DATA.UNIT_CAPS[sel.unit]||[]).includes('A'));
+  if(ambResponses.length){
+    baselineRank = Math.min(...ambResponses.map(s => s.rank));
+  } else {
+    for(const sel of responseSelections){ if(sel.rank < baselineRank) baselineRank = sel.rank; }
+  }
+  for(const [cap, count] of Object.entries(ifCloserCounts)){
+    if(!DATA.CAP_VOCAB.includes(cap)) continue;
+    let remaining = count;
+    const addCands = buildCandidatesByOrder(order, [cap], used);
+    for(const c of addCands){
+      if(remaining<=0) break;
+      // Add only if candidate is earlier in the run card order than the earliest response pick
+      if(c.rank < baselineRank){
+        out.push(c.unit);
+        used.add(c.unit);
+        remaining -= 1;
+      }
+    }
+  }
+
+  // 3) Apply station-based BLS exceptions
+  // If the recommended ambulance is from 924, drop any BLS from 911.
+  // If the recommended ambulance is from 930, drop any BLS from 910.
+  const ambulanceUnits = responseSelections.filter(s => (DATA.UNIT_CAPS[s.unit]||[]).includes('A'));
+  let ambStation = null;
+  if(ambulanceUnits.length){
+    ambStation = unitStation(ambulanceUnits[0].unit, order);
+  }
+  if(ambStation){
+    const filterOut = new Set();
+    if(ambStation === '924'){
+      // remove BLS units from station 911
+      for(const stU of (DATA.STATION_UNITS['911']||[])){
+        const caps = DATA.UNIT_CAPS[stU]||[];
+        if(caps.includes('BLS')) filterOut.add(stU);
+      }
+    }
+    if(ambStation === '930'){
+      for(const stU of (DATA.STATION_UNITS['910']||[])){
+        const caps = DATA.UNIT_CAPS[stU]||[];
+        if(caps.includes('BLS')) filterOut.add(stU);
+      }
+    }
+    if(filterOut.size){
+      const kept = [];
+      for(const token of out){
+        if(filterOut.has(token)) continue;
+        kept.push(token);
+      }
+      out.length = 0;
+      out.push(...kept);
+    }
+  }
+
+  return out;
+}
+
+async function main(){
+  try{
+    const res = await fetch('data.json'); DATA = await res.json();
+  }catch(e){
+    alert('Failed to load data.json: ' + e.message);
+    return;
+  }
+
+  map = L.map('map').setView([39.414, -77.410], 11);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'© OpenStreetMap contributors'}).addTo(map);
+  eszLayer = L.geoJSON(null, {style: {color:'#ef4444', weight:3, fillOpacity:0.15}}).addTo(map);
+
+  const sel = $('#incidentSelect');
+  const keys = Object.keys(DATA.PLAN_STRUCT).sort();
+  if(!keys.length){ sel.innerHTML = '<option value="">(no plans loaded)</option>'; }
+  else {
+    sel.innerHTML = keys.map(k=>`<option value="${k}">${k}</option>`).join('');
+    sel.value = keys[0];
+    const updateView = ()=>{
+      const plan = DATA.PLAN_STRUCT[sel.value];
+      const groups = plan?.groups || [];
+      const ifc = plan?.ifCloser || {};
+      $('#planRoles').textContent = 'Plan: ' + groups.map(g => (g.qty>1?g.qty+'× ':'') + g.caps.join(' OR ')).join(', ');
+      const ifcList = Object.entries(ifc).map(([k,v])=> v>1? (v+'× '+k) : k).join(', ');
+      $('#ifCloserView').innerHTML = ifcList ? ('If closer <b>(add-on by run card order)</b>: ' + ifcList) : '';
+    };
+    sel.addEventListener('change', updateView);
+    updateView();
+  }
+
+  map.on('click', async (e)=>{
+    window.__incidentPoint = [e.latlng.lat, e.latlng.lng];
+    addPoint(window.__incidentPoint);
+    setMsg($('#geocodeMsg'), `Point: ${e.latlng.lat.toFixed(6)}, ${e.latlng.lng.toFixed(6)}`, 'muted');
+    try{ const eszFeat=await fetchESZForPoint(e.latlng.lat,e.latlng.lng); showESZ(eszFeat); }
+    catch(err){ setMsg($('#geocodeMsg'), err.message, 'muted'); }
+  });
+
+  $('#btnSearch').addEventListener('click', async ()=>{
+    const mode=$('#searchMode').value; const q=$('#query').value.trim();
+    if(!q){ setMsg($('#geocodeMsg'),'Enter a search','muted'); return; }
+    setMsg($('#geocodeMsg'),'Searching…');
+    try{
+      let latlng;
+      if(mode==='address') latlng=await locateByAddress(q);
+      else if(mode==='poi') latlng=await locateByPOI(q);
+      else latlng=await locateByIntersection(q);
+      window.__incidentPoint = latlng;
+      addPoint(latlng);
+      setMsg($('#geocodeMsg'),`Found: ${latlng[0].toFixed(6)}, ${latlng[1].toFixed(6)}`,'muted');
+      const eszFeat=await fetchESZForPoint(latlng[0],latlng[1]);
+      showESZ(eszFeat);
+    }catch(e){ setMsg($('#geocodeMsg'), e.message||'Search failed','muted'); $('#eszInfo').textContent='—'; $('#eszOrder').textContent=''; eszLayer.clearLayers(); }
+  });
+
+  $('#btnRecommend').addEventListener('click', ()=>{
+    const esz=$('#eszInfo').textContent.trim();
+    const recDiv=$('#rec');
+    if(!esz || esz==='—'){ recDiv.innerHTML='<div class="muted">Locate a point first to get ESZ.</div>'; return; }
+    const units = recommendUnitsRunCardOnly_Additive(esz);
+    recDiv.innerHTML = '<div class="muted">Recommendation (run card + add-on IfCloser):</div>' +
+      '<div class="units">'+ units.map(u=>'<span class="pill">'+u+'</span>').join(' ') + '</div>';
+  });
+}
+
+window.addEventListener('DOMContentLoaded', main);
