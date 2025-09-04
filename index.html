@@ -1,0 +1,81 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>FDK Recommend</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>FDK Recommend</h1>
+
+    <div id="loadError" class="warn" style="display:none;"></div>
+
+    <div class="card">
+      <div class="muted">Step 1 • Locate</div>
+      <label>Search mode</label>
+      <div class="btnrow">
+        <select id="searchMode">
+          <option value="address">Address</option>
+          <option value="poi">Common place name (POI)</option>
+          <option value="intersection">Intersection (A & B)</option>
+        </select>
+        <input id="query" type="text" placeholder="123 Main St, Frederick MD" style="flex:1;">
+        <button id="btnSearch">Locate</button>
+      </div>
+      <div class="muted" id="geocodeMsg" style="margin-top:8px;"></div>
+      <div class="small muted">Tip: Click on the map to set a manual incident point.</div>
+    </div>
+
+    <div class="card">
+      <div class="muted">Step 2 • ESZ</div>
+      <div><span class="muted">Fire ESZ (Beat):</span> <span id="eszInfo">—</span></div>
+      <div class="muted small" id="eszOrder"></div>
+    </div>
+
+    <div class="card">
+      <div class="muted">Step 3 • Incident</div>
+      <label>Incident type</label>
+      <select id="incidentSelect"></select>
+      <div class="muted small" id="planRoles"></div>
+      <div class="muted small" id="ifCloserView"></div>
+      <div class="muted small" id="planFlavor"></div>
+      <div id="vocabWarn" class="warn small" style="display:none; margin-top:8px;"></div>
+      <div class="sep"></div>
+      <div class="btnrow">
+        <button id="btnRecommend">Get recommendation</button>
+        <button class="secondary" id="btnSend">Send dispatch</button>
+        <button class="secondary" id="btnStatus">Unit status…</button>
+      </div>
+      <div id="rec" style="margin-top:10px;"></div>
+      <details id="dbgToggle" style="margin-top:10px;"><summary>Debug: show selection reasons</summary><div id="dbg" class="debug"></div></details>
+      <div class="muted small" style="margin-top:8px;">Run-card only. “If closer” = earlier station in run-card order. Tokens matched exactly (K vs K3000, BT, MP, etc.). Units marked <b>PA</b> or <b>CALL</b> are excluded unless changed to <b>AQ</b>.</div>
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<div class="modal" id="statusModal" aria-hidden="true">
+  <div class="panel">
+    <header>
+      <h3>Unit status (AQ / CALL / PA) & capabilities</h3>
+      <div class="btnrow">
+        <button class="secondary" id="btnResetStatus">Reset statuses & capabilities</button>
+        <button id="btnCloseStatus">Close</button>
+      </div>
+    </header>
+    <div class="content">
+      <div id="statusContent"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+<script src="app.js?v=v35"></script>
+</body>
+</html>
