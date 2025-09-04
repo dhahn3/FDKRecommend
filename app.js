@@ -1,0 +1,423 @@
+
+const ESZ_URL = "https://fcgis.frederickcountymd.gov/server_pub/rest/services/PublicSafety/EmergencyESZ/MapServer/0";
+const ADDR_URL = "https://fcgis.frederickcountymd.gov/server_pub/rest/services/Basemap/Addresses/MapServer/1";
+const CENTERLINE_URL = "https://fcgis.frederickcountymd.gov/server_pub/rest/services/Basemap/Centerlines/MapServer/0";
+const POI_URL = "https://fcgis.frederickcountymd.gov/server/rest/services/Basemap/Basemap/MapServer/18";
+
+let DATA = null;
+let map, pointMarker, eszLayer;
+
+const $ = (s)=>document.querySelector(s);
+function setMsg(el, text, cls='muted'){ el.className = cls; el.textContent = text; }
+function toEsriPoint(lng, lat){ return {x:lng, y:lat, spatialReference:{wkid:4326}}; }
+async function fetchJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+function encodeParams(p){ return Object.entries(p).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&'); }
+function addPoint(latlng){ if(pointMarker) map.removeLayer(pointMarker); pointMarker=L.marker(latlng).addTo(map); }
+function normalizeStationId(id){ const s=String(id||''); const m=s.match(/(\d{3})$/); return m?m[1]:s; }
+
+// Capability helpers
+function normCap(s){ return String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+function hasCap(unit, cap){
+  const caps = (DATA?.UNIT_CAPS?.[unit]||[]).map(normCap);
+  return caps.includes(normCap(cap));
+}
+const SU_PREF_STATIONS = new Set(['909','921','913']); // BLS-only preference for SUxx
+
+// Geocoders
+async function locateByAddress(q){
+  const caps = q.toUpperCase();
+  const where = `UPPER(ADD_FULL) LIKE '${caps.replace(/'/g,"''")}%' OR UPPER(ST_FULL) LIKE '${caps.replace(/'/g,"''")}%'`;
+  const url = `${ADDR_URL}/query?` + encodeParams({ where, outFields:'*', returnGeometry:true, f:'json', outSR:4326 });
+  const data = await fetchJSON(url);
+  if(!data.features?.length) throw new Error('No matches');
+  const f = data.features.find(f=>f.attributes.ST_NUM!=null) || data.features[0];
+  const {x,y} = f.geometry; return [y,x];
+}
+async function locateByPOI(q){
+  const caps = q.toUpperCase();
+  const where = `UPPER(NAME) LIKE '%${caps.replace(/'/g,"''")}%'`;
+  const url = `${POI_URL}/query?` + encodeParams({ where, outFields:'*', returnGeometry:true, f:'json', outSR:4326 });
+  const data = await fetchJSON(url);
+  if(!data.features?.length) throw new Error('No POI found');
+  const {x,y} = data.features[0].geometry; return [y,x];
+}
+async function locateByIntersection(q){
+  const parts = q.split(/&| and /i).map(s=>s.trim()).filter(Boolean);
+  if(parts.length<2) throw new Error('Enter like "Street A & Street B"');
+  const [a,b] = parts.map(s=>s.toUpperCase().replace(/'/g,"''"));
+  const common = "&returnGeometry=true&f=json&outSR=4326&outFields=ST_NAME";
+  const [fa,fb] = await Promise.all([
+    fetchJSON(`${CENTERLINE_URL}/query?where=${encodeURIComponent(`UPPER(ST_NAME) LIKE '%${a}%'`)}${common}`),
+    fetchJSON(`${CENTERLINE_URL}/query?where=${encodeURIComponent(`UPPER(ST_NAME) LIKE '%${b}%'`)}${common}`)
+  ]);
+  if(!fa.features?.length || !fb.features?.length) throw new Error('One or both streets not found');
+  const toLine = f => ({type:'Feature', properties:{name:f.attributes.ST_NAME}, geometry:{type:'LineString', coordinates:f.geometry.paths[0].map(p=>[p[0],p[1]])}});
+  const la=fa.features.map(toLine), lb=fb.features.map(toLine);
+  let intersections = [];
+  for(const ga of la){ for(const gb of lb){ const pts=turf.lineIntersect(ga,gb); if(pts.features.length) intersections.push(...pts.features); } }
+  if(!intersections.length) throw new Error('No line intersection found');
+  const [lng,lat] = intersections[0].geometry.coordinates; return [lat,lng];
+}
+
+// ESZ fetch+draw
+async function fetchESZForPoint(lat,lng){
+  const geom = JSON.stringify(toEsriPoint(lng,lat));
+  const url = `${ESZ_URL}/query?`+encodeParams({
+    geometry:geom, geometryType:'esriGeometryPoint', inSR:4326, spatialRel:'esriSpatialRelIntersects',
+    outFields:'*', returnGeometry:true, outSR:4326, f:'json'
+  });
+  const data = await fetchJSON(url);
+  if(!data.features?.length) throw new Error('No ESZ found at that location');
+  return data.features[0];
+}
+function showESZ(feature){
+  if(!eszLayer) return;
+  eszLayer.clearLayers();
+  const rings = feature.geometry.rings.map(r=>r.map(([x,y])=>[x,y]));
+  eszLayer.addData({type:'Feature', properties:feature.attributes, geometry:{type:'Polygon', coordinates:rings}});
+  map.fitBounds(eszLayer.getBounds(), {padding:[20,20]});
+  const attrs = feature.attributes||{};
+  const esz = (attrs.ESZ ?? attrs.esz ?? '').toString().padStart(4,'0');
+  $('#eszInfo').textContent = esz || '—';
+  const order = DATA?.ESZ_ORDER?.[esz] || [];
+  $('#eszOrder').textContent = order.length ? ('Station order: ' + order.map(v=>normalizeStationId(v)).join(' → ')) : 'No station order on file.';
+}
+
+// Selection helpers
+function stationRank(eszOrder, st){ return eszOrder.findIndex(v => normalizeStationId(v)===st); }
+function unitStation(unit, eszOrder){
+  for(const stRaw of eszOrder){
+    const st = normalizeStationId(stRaw);
+    const arr = (DATA?.STATION_UNITS?.[st])||[];
+    if(arr.includes(unit)) return st;
+  }
+  return null;
+}
+function buildCandidatesByOrder(eszOrder, capsNeeded, used){
+  const cand = [];
+  const capsNeededNorm = (capsNeeded||[]).map(normCap);
+  for(const [idx, stRaw] of eszOrder.entries()){
+    const st = normalizeStationId(stRaw);
+    let units = ((DATA?.STATION_UNITS?.[st])||[]).slice();
+    // SU preference for BLS-only at 909/921/913
+    const wantsOnlyBLS = capsNeededNorm.length===1 && capsNeededNorm[0]==='BLS';
+    if(wantsOnlyBLS && SU_PREF_STATIONS.has(st)){
+      const suFirst = units.filter(u=>/^SU\d+$/i.test(u));
+      const rest = units.filter(u=>!/^SU\d+$/i.test(u));
+      units = suFirst.concat(rest);
+    }
+    for(const u of units){
+      if(used.has(u)) continue;
+      const capsNorm = ((DATA?.UNIT_CAPS?.[u]) || []).map(normCap);
+      for(const cap of capsNeededNorm){
+        if(capsNorm.includes(cap)){
+          cand.push({unit:u, cap:cap, st:st, rank:idx});
+        }
+      }
+    }
+  }
+  cand.sort((a,b)=> a.rank - b.rank);
+  return cand;
+}
+
+// Core recommender
+function recommendUnitsRunCard_Additive(esz){
+  const order = (DATA?.ESZ_ORDER?.[esz]||[]).map(normalizeStationId);
+  const isESZ50 = (esz && String(esz).startsWith('50'));
+  const incidentKey = $('#incidentSelect').value;
+  const plan = DATA?.PLAN_STRUCT?.[incidentKey];
+  if(!plan) return [];
+  const groups = plan.groups || [];
+  const ifCloserCounts = Object.assign({}, plan.ifCloser || {});
+  const used = new Set();
+  const results = []; // {unit, roleCap, from:'RESP'|'IFC', st, rank}
+  const responseSelections = [];
+
+  // Unknown capability banner
+  const tokenExists = (tok)=>{
+    const T = normCap(tok);
+    for(const arr of Object.values(DATA?.STATION_UNITS||{})){
+      for(const u of arr){
+        const caps = ((DATA?.UNIT_CAPS?.[u])||[]).map(normCap);
+        if(caps.includes(T)) return true;
+      }
+    }
+    return (T==='BC');
+  };
+  const unknown = new Set();
+  for(const g of groups) g.caps.forEach(c => { if(!tokenExists(c)) unknown.add(c); });
+  Object.keys(ifCloserCounts||{}).forEach(c => { if(!tokenExists(c)) unknown.add(c); });
+  $('#vocabWarn').style.display = unknown.size ? 'block' : 'none';
+  $('#vocabWarn').textContent = unknown.size ? ('Unknown capability tokens (no unit advertises: ' + Array.from(unknown).join(', ')+')') : '';
+
+  // RESPONSE
+  for(const g of groups){
+    for(let i=0;i<g.qty;i++){
+      // HM33 rule (skip in 50xx ESZ)
+      if (g.caps.map(x => String(x).toUpperCase()).includes('HM') && i===0 && !isESZ50) {
+        const hm33 = 'HM33';
+        const hmCands = buildCandidatesByOrder(order, ['HM'], used);
+        let hm33Added = false;
+        const hm33St = unitStation(hm33, order);
+        if (hm33St && hasCap(hm33,'HM') && !used.has(hm33)) {
+          const hm33Rank = stationRank(order, hm33St);
+          used.add(hm33);
+          results.push({unit:hm33, roleCap:'HM', from:'RESP', st:hm33St, rank:hm33Rank});
+          responseSelections.push({unit:hm33, roleCap:'HM', st:hm33St, rank:hm33Rank});
+          hm33Added = true;
+        }
+        let taken = hm33Added ? 1 : 0;
+        for (const c of hmCands) {
+          if (taken >= g.qty) break;
+          if (c.unit === 'HM33') continue;
+          if (used.has(c.unit)) continue;
+          used.add(c.unit);
+          results.push({unit:c.unit, roleCap:'HM', from:'RESP', st:c.st, rank:c.rank});
+          responseSelections.push({unit:c.unit, roleCap:'HM', st:c.st, rank:c.rank});
+          taken += 1;
+        }
+        const hm33Sel = responseSelections.find(r => r.unit==='HM33' && r.roleCap==='HM');
+        if (hm33Sel && Number.isFinite(hm33Sel.rank)) {
+          const closer = hmCands.find(c => c.unit!=='HM33' && !used.has(c.unit) && c.rank < hm33Sel.rank);
+          if (closer) {
+            used.add(closer.unit);
+            results.push({unit:closer.unit, roleCap:'HM', from:'RESP', st:closer.st, rank:closer.rank});
+            responseSelections.push({unit:closer.unit, roleCap:'HM', st:closer.st, rank:closer.rank});
+          }
+        }
+        i = g.qty; continue;
+      }
+
+      // BC group
+      if(g.caps.includes('BC')){
+        const bcUnits = (DATA.BC_UNITS||[]).filter(u=>!used.has(u));
+        let picked=null, pickedSt=null, pickedRank=Infinity;
+        for(const [idx, stRaw] of order.entries()){
+          const st = normalizeStationId(stRaw);
+          const units = (DATA.STATION_UNITS[st] || []);
+          const present = units.find(u => bcUnits.includes(u));
+          if(present){ picked=present; pickedSt=st; pickedRank=idx; break; }
+        }
+        if(picked){
+          used.add(picked); results.push({unit:picked, roleCap:'BC', from:'RESP', st:pickedSt, rank:pickedRank});
+          responseSelections.push({unit:picked, roleCap:'BC', st:pickedSt, rank:pickedRank});
+        } else {
+          results.push({unit:'(BC needed)', roleCap:'BC', from:'RESP', st:null, rank:Infinity});
+        }
+        continue;
+      }
+
+      // OR groups with preferences: (A OR MP) prefer A if earlier; (BR OR E) prefer BR if earlier
+      const caps = g.caps.slice();
+      const capsN = caps.map(normCap);
+      const setKey = new Set(capsN);
+      const isAorMP = setKey.size===2 && setKey.has('A') && setKey.has('MP');
+      const isBRorE = setKey.size===2 && setKey.has('BR') && setKey.has('E');
+
+      if (isAorMP || isBRorE) {
+        const pref1 = isAorMP ? 'A' : 'BR';
+        const pref2 = isAorMP ? 'MP' : 'E';
+        const pick1 = buildCandidatesByOrder(order, [pref1], used)[0] || null;
+        const pick2 = buildCandidatesByOrder(order, [pref2], used)[0] || null;
+        let choose = null;
+        if (pick1 && pick2) choose = (pick1.rank <= pick2.rank) ? pick1 : pick2;
+        else choose = pick1 || pick2;
+        if (choose) {
+          used.add(choose.unit);
+          results.push({unit:choose.unit, roleCap:normCap(choose.cap), from:'RESP', st:choose.st, rank:choose.rank});
+          responseSelections.push({unit:choose.unit, roleCap:normCap(choose.cap), st:choose.st, rank:choose.rank});
+        } else {
+          results.push({unit:'(' + caps.join(' OR ') + ' needed)', roleCap:normCap(caps[0]||'OTHER'), from:'RESP', st:null, rank:Infinity});
+        }
+        continue;
+      }
+
+      // Default OR handling
+      const cands = buildCandidatesByOrder(order, caps, used);
+      if(cands.length){
+        const chosen = cands[0];
+        used.add(chosen.unit);
+        results.push({unit:chosen.unit, roleCap:normCap(chosen.cap), from:'RESP', st:chosen.st, rank:chosen.rank});
+        responseSelections.push({unit:chosen.unit, roleCap:normCap(chosen.cap), st:chosen.st, rank:chosen.rank});
+      } else {
+        results.push({unit:'(' + caps.join(' OR ') + ' needed)', roleCap:normCap(caps[0]||'OTHER'), from:'RESP', st:null, rank:Infinity});
+      }
+    }
+  }
+
+  // Baseline for If-Closer (ambulance anchor or earliest pick)
+  const ambResponses = responseSelections.filter(sel => hasCap(sel.unit,'A'));
+  let baselineRank = ambResponses.length ? Math.min(...ambResponses.map(s=>s.rank)) : Infinity;
+  if(baselineRank===Infinity){
+    for(const sel of responseSelections){ if(sel.rank < baselineRank) baselineRank = sel.rank; }
+  }
+
+  // IF-CLOSER add-ons
+  for(const [capRaw, count] of Object.entries(ifCloserCounts)){
+    let remaining = count;
+    const addCands = buildCandidatesByOrder(order, [capRaw], used);
+    for(const c of addCands){
+      if(remaining<=0) break;
+      if(c.rank < baselineRank){
+        used.add(c.unit);
+        results.push({unit:c.unit, roleCap:normCap(c.cap), from:'IFC', st:c.st, rank:c.rank});
+        remaining -= 1;
+      }
+    }
+  }
+
+  // BLS EXCEPTIONS (drop only BLS role from paired stations)
+  const ambSel = ambResponses[0] || null;
+  if(ambSel){
+    const ambSt = ambSel.st;
+    if(ambSt === '924' || ambSt === '930'){
+      const dropSt = ambSt==='924' ? '911' : '910';
+      const kept=[];
+      for(const r of results){
+        const isBLSfromDropStation = (r.roleCap === 'BLS') && (DATA.STATION_UNITS[dropSt]||[]).includes(r.unit);
+        if(!isBLSfromDropStation) kept.push(r);
+      }
+      results.length=0; results.push(...kept);
+    }
+  }
+
+  window.__lastDebug = {esz, incident: $('#incidentSelect').value, selections: responseSelections, all: results};
+  return results;
+}
+
+// UI bootstrap with resilient data load
+async function main(){
+  // Map first (always)
+  map = L.map('map').setView([39.414, -77.410], 11);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'© OpenStreetMap contributors'}).addTo(map);
+  eszLayer = L.geoJSON(null, {style: {color:'#ef4444', weight:3, fillOpacity:0.15}}).addTo(map);
+
+  // Map click
+  map.on('click', async (e)=>{
+    window.__incidentPoint = [e.latlng.lat, e.latlng.lng];
+    addPoint(window.__incidentPoint);
+    setMsg($('#geocodeMsg'), `Point: ${e.latlng.lat.toFixed(6)}, ${e.latlng.lng.toFixed(6)}`);
+    try{ const eszFeat=await fetchESZForPoint(e.latlng.lat,e.latlng.lng); showESZ(eszFeat); }
+    catch(err){ setMsg($('#geocodeMsg'), err.message, 'warn'); }
+  });
+
+  // Try loading data.json
+  try{
+    const res = await fetch('data.json?v=' + Date.now());
+    DATA = await res.json();
+  }catch(e){
+    const el = $('#loadError');
+    el.style.display = 'block';
+    el.textContent = 'Failed to load data.json — the map works, but incidents will be empty. Check that data.json is deployed next to index.html. (' + (e.message||e) + ')';
+    console.error(e);
+    DATA = {ESZ_ORDER:{}, STATION_UNITS:{}, UNIT_CAPS:{}, PLAN_STRUCT:{}};
+  }
+
+  // Incident select
+  const sel = $('#incidentSelect');
+  const keys = Object.keys(DATA.PLAN_STRUCT||{}).sort();
+  sel.innerHTML = keys.length ? keys.map(k=>`<option value="${k}">${k}</option>`).join('') : '<option value="">(no plans loaded)</option>';
+  if(keys.length) sel.value = keys[0];
+
+  const updateView = ()=>{
+    const plan = (DATA.PLAN_STRUCT||{})[sel.value];
+    const groups = plan?.groups || [];
+    const ifc = plan?.ifCloser || {};
+    $('#planRoles').textContent = 'Plan: ' + groups.map(g => (g.qty>1?g.qty+'× ':'') + g.caps.join(' OR ')).join(', ');
+    const ifcList = Object.entries(ifc).map(([k,v])=> v>1? (v+'× '+k) : k).join(', ');
+    $('#ifCloserView').innerHTML = ifcList ? ('If closer <b>(earlier in run card)</b>: ' + ifcList) : '';
+  };
+  sel.addEventListener('change', updateView);
+  updateView();
+
+  // Search
+  $('#btnSearch').addEventListener('click', async ()=>{
+    const mode=$('#searchMode').value; const q=$('#query').value.trim();
+    if(!q){ setMsg($('#geocodeMsg'),'Enter a search'); return; }
+    setMsg($('#geocodeMsg'),'Searching…');
+    try{
+      let latlng;
+      if(mode==='address') latlng=await locateByAddress(q);
+      else if(mode==='poi') latlng=await locateByPOI(q);
+      else latlng=await locateByIntersection(q);
+      window.__incidentPoint = latlng;
+      addPoint(latlng);
+      setMsg($('#geocodeMsg'),`Found: ${latlng[0].toFixed(6)}, ${latlng[1].toFixed(6)}`);
+      const eszFeat=await fetchESZForPoint(latlng[0],latlng[1]);
+      showESZ(eszFeat);
+    }catch(e){ setMsg($('#geocodeMsg'), e.message||'Search failed', 'warn'); $('#eszInfo').textContent='—'; $('#eszOrder').textContent=''; eszLayer.clearLayers(); }
+  });
+
+  // Recommend
+  $('#btnRecommend').addEventListener('click', ()=>{
+    const esz=$('#eszInfo').textContent.trim();
+    const recDiv=$('#rec');
+    if(!esz || esz==='—'){ recDiv.innerHTML='<div class="muted">Locate a point first to get ESZ.</div>'; return; }
+    const rows = recommendUnitsRunCard_Additive(esz);
+
+    const respRows = rows.filter(r => r.from === 'RESP');
+    const ifcRows  = rows.filter(r => r.from === 'IFC');
+    const groupsResp = {}; for (const r of respRows) (groupsResp[r.roleCap] = groupsResp[r.roleCap] || []).push(r.unit);
+    const groupsIfc = {};  for (const r of ifcRows)  (groupsIfc[r.roleCap]  = groupsIfc[r.roleCap]  || []).push(r.unit);
+
+    const incidentKey = $('#incidentSelect').value;
+    const plan = (DATA.PLAN_STRUCT||{})[incidentKey];
+    const norm = s => String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    const planRespOrder = [];
+    for (const g of (plan?.groups || [])) {
+      const capsNorm = (g.caps || []).map(norm);
+      const picked = respRows.find(r => capsNorm.includes(norm(r.roleCap)));
+      const key = picked ? picked.roleCap : (capsNorm[0] || 'OTHER');
+      if (!planRespOrder.includes(key)) planRespOrder.push(key);
+    }
+
+    const requiredCounts = {};
+    for (const g of (plan?.groups || [])) {
+      const capsNorm = (g.caps || []).map(norm);
+      const picked = respRows.find(r => capsNorm.includes(norm(r.roleCap)));
+      const key = picked ? picked.roleCap : (capsNorm[0] || 'OTHER');
+      requiredCounts[key] = (requiredCounts[key] || 0) + (g.qty || 1);
+    }
+
+    const ifcCapsOrder = [];
+    for (const r of ifcRows) {
+      if (!planRespOrder.includes(r.roleCap) && !ifcCapsOrder.includes(r.roleCap)) ifcCapsOrder.push(r.roleCap);
+    }
+
+    const allCapsSeen = new Set([...Object.keys(groupsResp), ...Object.keys(groupsIfc)]);
+    const extras = [];
+    for (const cap of allCapsSeen) {
+      if (!planRespOrder.includes(cap) && !ifcCapsOrder.includes(cap)) extras.push(cap);
+    }
+
+    let html = '<div class="muted">Recommendation (run card + add-on IfCloser):</div>';
+    for (const key of planRespOrder) {
+      const have = (groupsResp[key] || []).slice();
+      const need = requiredCounts[key] || have.length;
+      while (have.length < need) have.push('(' + key + ' needed)');
+      html += '<div style="margin-top:6px;"><b>' + key + ':</b> <div class="units">' + have.map(u => '<span class="pill">' + u + '</span>').join(' ') + '</div></div>';
+    }
+    for (const key of ifcCapsOrder) {
+      const arr = groupsIfc[key];
+      if (!arr || !arr.length) continue;
+      html += '<div style="margin-top:6px;"><b>' + key + ' (If closer):</b> <div class="units">' + arr.map(u => '<span class="pill">' + u + '</span>').join(' ') + '</div></div>';
+    }
+    for (const key of extras) {
+      const arr = (groupsResp[key] || []).concat(groupsIfc[key] || []);
+      if (!arr.length) continue;
+      html += '<div style="margin-top:6px;"><b>' + key + ':</b> <div class="units">' + arr.map(u => '<span class="pill">' + u + '</span>').join(' ') + '</div></div>';
+    }
+
+    recDiv.innerHTML = html;
+
+    const dbg = window.__lastDebug || null;
+    if(dbg){
+      const out=[];
+      out.push(`RESP picks: ${respRows.map(r=>r.unit+'['+r.roleCap+']@'+r.st+'/'+r.rank).join(', ')}`);
+      out.push(`IFC picks: ${ifcRows.map(r=>r.unit+'['+r.roleCap+']@'+r.st+'/'+r.rank).join(', ')}`);
+      $('#dbg').textContent = out.join('\\n');
+    }
+  });
+}
+
+window.addEventListener('DOMContentLoaded', main);
