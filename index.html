@@ -1,0 +1,85 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FDK Recommend</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="styles.css?v=v47"/>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>FDK Recommend</h1>
+    <div id="loadWarn" class="warn" style="display:none;"></div>
+    <div class="card">
+      <div class="small">Step 1 • Locate</div>
+      <label>Search mode</label>
+      <div class="btnrow">
+        <select id="searchMode">
+          <option value="address">Address</option>
+          <option value="poi">Common place name (POI)</option>
+          <option value="intersection">Intersection (A & B)</option>
+        </select>
+        <input id="q" type="text" placeholder="123 Main St, Frederick MD" style="flex:1"/>
+        <button id="btnLocate">Locate</button>
+      </div>
+      <div id="geoMsg" class="small" style="margin-top:6px"></div>
+      <div class="small">Tip: Click on the map to set a manual incident point.</div>
+    </div>
+    <div class="card">
+      <div class="small">Step 2 • ESZ</div>
+      <div><span class="small">Fire ESZ (Beat):</span> <b id="esz">—</b></div>
+      <div class="small" id="order"></div>
+    </div>
+    <div class="card">
+      <div class="small">Step 3 • Incident</div>
+      <label>Incident type</label>
+      <select id="incident"></select>
+      <div class="btnrow" style="margin-top:6px">
+        <label class="toggle"><input id="mutualAid" type="checkbox"/> Mutual Aid</label>
+      </div>
+      <div id="planTxt" class="small" style="margin-top:6px"></div>
+      <div id="ifcTxt" class="small"></div>
+      <div id="flavor" class="small"></div>
+      <div id="vocab" class="warn small" style="display:none"></div>
+      <div class="btnrow" style="margin-top:6px">
+        <button id="btnRec">Get recommendation</button>
+        <button id="btnDispatch" class="secondary">Send dispatch</button>
+        <button id="btnStatus" class="secondary">Unit status…</button>
+      </div>
+      <div id="rec" style="margin-top:6px"></div>
+      <details style="margin-top:8px">
+        <summary>Debug: show selection reasons</summary>
+        <div id="dbg" class="debug"></div>
+      </details>
+      <div class="small" style="margin-top:8px">
+        Run-card only. “If closer” = earlier station in run-card order. Tokens matched exactly (K vs K3000, BT, MP, etc.).
+        Units marked <b>PA</b> or <b>CALL</b> are excluded unless changed to <b>AQ</b>.
+        When <b>Mutual Aid</b> is OFF, only 900-series stations (901–999) are eligible.
+      </div>
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<div class="modal" id="statusModal" aria-hidden="true">
+  <div class="panel">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2 style="margin:0">Unit status & capabilities</h2>
+      <div class="btnrow">
+        <button id="btnResetCaps" class="secondary">Reset caps to defaults</button>
+        <button id="btnCloseStatus">Close</button>
+      </div>
+    </div>
+    <hr class="sep"/>
+    <div id="statusGrid"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+<script src="app.js?v=v47"></script>
+</body>
+</html>
