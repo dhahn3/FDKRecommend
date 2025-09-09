@@ -1,0 +1,14 @@
+
+:root{--bg:#0f172a;--card:#111827;--text:#d1d5db;--muted:#9ca3af;--pill:#1f2937;--pillb:#60a5fa}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
+#app{display:grid;grid-template-columns:380px 1fr;min-height:100vh}
+#side{padding:16px}
+h1{margin:0 0 12px 0}
+.card{background:var(--card);padding:12px;border-radius:10px;margin-bottom:12px;border:1px solid #111}
+.small{color:var(--muted);font-size:.9rem}
+.btnrow{display:flex;gap:8px;align-items:center}
+button{background:#2563eb;color:white;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+button.secondary{background:#374151}
+.warn{background:#7c2d12;color:#fde68a;padding:8px;border-radius:8px}
+.ok{background:#064;color:#cfe;padding:6px 8px;border-radius:6px}
+select,input{background:#0b1220;color:var(--text);border:1px solid #1f2937;border-radius:8px;padding:8px}
