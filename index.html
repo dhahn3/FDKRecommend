@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FDK Recommend</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>FDK Recommend</h1>
+    <div id="banner" class="ok" style="display:block">Ready</div>
+
+    <div class="card">
+      <div class="small">Step 1 • Location</div>
+      <div class="row">
+        <select id="searchMode">
+          <option value="address" selected>Address</option>
+          <option value="intersection">Intersection</option>
+          <option value="poi">POI</option>
+        </select>
+        <input id="q" placeholder="200 N Main St"/>
+        <button id="btnLocate">Locate</button>
+      </div>
+      <div class="row small">Click the map or search above. ESZ will set automatically.</div>
+    </div>
+
+    <div class="card">
+      <div class="small">Step 2 • Beat</div>
+      <div class="row">
+        <label>ESZ:</label>
+        <span id="esz">—</span>
+      </div>
+      <div id="stationOrder" class="small" style="margin-top:4px"></div>
+      <div class="row" style="margin-top:8px">
+        <label class="toggle"><input id="mutualAid" type="checkbox" checked/> Mutual Aid</label>
+        <button id="btnStatus" class="secondary">Unit status…</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="resetCaps" class="secondary">Reset ad‑hoc caps</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="small">Step 3 • Incident</div>
+      <label>Incident type</label>
+      <select id="incident"></select>
+      <div id="planTxt" class="small" style="margin-top:6px"></div>
+      <div class="btnrow" style="margin-top:6px">
+        <button id="btnRec">Get recommendation</button>
+        <button id="btnDispatch" class="secondary">Send dispatch</button>
+      </div>
+      <div id="rec"></div>
+      <details style="margin-top:8px">
+        <summary>Debug: show selection reasons</summary><pre id="dbg" class="small"></pre>
+      </details>
+      <div class="small" style="margin-top:8px">
+        Run card only. “If closer” = earlier station in run card is eligible; hydrant overrides are honored unless set to AQ. Mutual Aid OFF ⇒ only 900‑series stations.
+      </div>
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<div class="modal" id="statusModal" aria-hidden="true">
+  <div class="panel">
+    <h2>Unit status & caps</h2>
+    <div id="statusGrid"></div>
+    <div class="btnrow">
+      <button id="closeStatus">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/esri-leaflet@3/dist/esri-leaflet.js"></script>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
